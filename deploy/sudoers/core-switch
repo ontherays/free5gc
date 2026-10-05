@@ -1,0 +1,4 @@
+# ETHOS core switching on <SERVICE_USER>. Amendment D3a to the read-only-SSH decision D3:
+# the observation path (SSHProber) stays read-only; this is the one sanctioned mutation,
+# reachable only through these four fully-qualified, argument-pinned commands.
+<SERVICE_USER> ALL=(root) NOPASSWD: /usr/local/bin/core-switch open5gs, /usr/local/bin/core-switch free5gc, /usr/local/bin/core-switch status, /usr/local/bin/core-switch health

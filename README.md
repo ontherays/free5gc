@@ -1,40 +1,35 @@
-<p align="center">
-<a href="https://free5gc.org"><img width="40%" src="https://forum.free5gc.org/uploads/default/original/1X/324695bfc6481bd556c11018f2834086cf5ec645.png" alt="free5GC"/></a>
-</p>
+# free5GC v4.2.3, built from source, sharing a host with Open5GS
 
-<p align="center">
-<a href="https://github.com/free5gc/free5gc/releases"><img src="https://img.shields.io/github/v/release/free5gc/free5gc?color=orange" alt="Release"/></a>
-<a href="https://github.com/free5gc/free5gc/blob/master/LICENSE.txt"><img src="https://img.shields.io/github/license/free5gc/free5gc?color=blue" alt="License"/></a>
-<a href="https://forum.free5gc.org"><img src="https://img.shields.io/discourse/topics?server=https%3A%2F%2Fforum.free5gc.org&color=lightblue" alt="Forum"/></a>
-<a href="https://www.codefactor.io/repository/github/free5gc/free5gc"><img src="https://www.codefactor.io/repository/github/free5gc/free5gc/badge" alt="CodeFactor" /></a>
-<a href="https://goreportcard.com/report/github.com/free5gc/free5gc"><img src="https://goreportcard.com/badge/github.com/free5gc/free5gc" alt="Go Report Card" /></a>
-<a href="https://github.com/free5gc/free5gc/pulls"><img src="https://img.shields.io/badge/PRs-Welcome-brightgreen" alt="PRs Welcome"/></a>
-<a href="https://www.bestpractices.dev/projects/9435"><img src="https://www.bestpractices.dev/projects/9435/badge"></a>
-</p>
+free5GC v4.2.3 with its 15 submodules pinned to the upstream tag, plus the configuration,
+systemd units and scripts needed to run it on an Ubuntu 22.04 host that already runs Open5GS.
 
-## What is free5GC
+Both cores bind the same N2, N3 and N4 addresses, so only one runs at a time. A switch script
+stops one, starts the other, and verifies the sockets actually moved. Open5GS is the default
+and the host is returned to it when free5GC work finishes.
 
-The free5GC (a Linux Foundation project) is an open-source project for 5th generation (5G) mobile core networks. The ultimate goal of this project is to implement the 5G core network (5GC) defined in 3GPP Release 15 (R15) and beyond.
+**[docs/install.md](docs/install.md)** is the installation guide: prerequisites, the `gtp5g`
+DKMS module, the build, the configuration that differs from upstream, host networking, the
+units, the switch, subscriber provisioning, verification and troubleshooting.
 
-For more information, please refer to [free5GC official site](https://free5gc.org/).
+## Layout
 
-## Documentation
+| Path | Contents |
+| --- | --- |
+| `config/` | `amfcfg.yaml`, `smfcfg.yaml`, `upfcfg.yaml` and `nssfcfg.yaml`, edited for a shared host. Every other file is upstream's. |
+| `deploy/systemd/` | `free5gc.service` and `free5gc-webconsole.service`. Static units, never enabled, started only by the switch script. |
+| `deploy/scripts/` | `core-switch`, which enforces one core at a time, and `stop_open5gs.sh`, which stops Open5GS and proves the sockets are free. |
+| `deploy/sudoers/` | The sudoers rule allowing an unprivileged account to run `core-switch` and nothing else. |
+| `docs/` | The installation guide. |
+| `force_kill-shared.sh` | Stops free5GC without touching anything else on the host: no `killall tcpdump`, no `rm /dev/mqueue/*`, no database drop. |
 
-For document, please refer to [free5gc.org/guide/](https://free5gc.org/guide/).
+Everything else is free5GC v4.2.3 as released.
 
-## Discussion
+Host-specific values are placeholders such as `<CORE_HOST_IP>` and `<INSTALL_DIR>`, listed in a
+table at the top of the guide.
 
-For questions and support please use the [official forum](https://forum.free5gc.org). The issue list of this repo is exclusively for bug reports and feature requests.
+## Upstream
 
-## Contributing
-
-We welcome you for contribution via [GitHub Pull Request](https://github.com/free5gc/free5gc/pulls).
-
-## Release Note
-
-Detailed changes for each release are documented in the [release notes](https://github.com/free5gc/free5gc/releases).
-
-## License
-
-free5GC is now under [Apache 2.0](https://github.com/free5gc/free5gc/blob/master/LICENSE.txt) license.
-
+free5GC is developed by the [free5GC project](https://free5gc.org) and is licensed under the
+Apache License 2.0; see [LICENSE](LICENSE). This repository is a pinned build of
+[free5gc/free5gc](https://github.com/free5gc/free5gc) at tag `v4.2.3` with deployment material
+added. The NF source is unmodified.

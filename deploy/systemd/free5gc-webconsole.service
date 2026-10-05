@@ -1,0 +1,18 @@
+[Unit]
+Description=free5GC WebConsole (provisioning) - <SERVICE_USER>
+PartOf=free5gc.service
+After=network-online.target mongod.service
+Requires=mongod.service
+
+[Service]
+Type=simple
+User=root
+# cwd must be webconsole/ because webui_service.PublicPath is the RELATIVE path "public".
+# The config is then passed absolutely, and webconsole/cert -> ../cert makes the relative
+# `cert/chf.pem` in webuicfg.yaml resolve to the repo's cert/ directory.
+WorkingDirectory=<INSTALL_DIR>/webconsole
+ExecStart=<INSTALL_DIR>/webconsole/bin/webconsole -c <INSTALL_DIR>/config/webuicfg.yaml
+Restart=on-failure
+RestartSec=3
+
+# No [Install] section: never enabled.

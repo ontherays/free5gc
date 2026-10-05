@@ -1,0 +1,383 @@
+#!/bin/bash
+# /usr/local/bin/core-switch — run exactly ONE 5G core on <SERVICE_USER> (<CORE_HOST_IP>).
+#
+#   core-switch open5gs   stop free5GC, start Open5GS   (the production default)
+#   core-switch free5gc   stop Open5GS, start free5GC
+#   core-switch status    machine-readable key=value state dump
+#   core-switch health    status + a full health check of whichever core is up
+#
+# WHY THIS EXISTS
+#   Both cores need <CORE_HOST_IP>:38412/sctp, :2152/udp and :8805/udp. They can never run
+#   together. Open5GS is NOT a systemd service — its processes live in an SSH login scope
+#   (session-NNN.scope), so `systemctl stop` cannot reach them. Mutual exclusion is therefore
+#   enforced here: an flock, plus kernel socket checks. The socket table is the truth; the
+#   process list and any script's exit code are not.
+#
+# EXIT CODES
+#   0 ok | 1 usage / not root | 2 lock held | 3 stop failed | 4 start or health failed
+#
+# SAFETY
+#   * Never flushes iptables (-F/-X/-P). Every rule change is pool-scoped and idempotent.
+#   * Never touches ogstun, the 10.45.0.0/16 rules, any configured IP address, another
+#     service's iptables chains, or the MongoDB `open5gs` database.
+#   * Open5GS start runs as user <SERVICE_USER> so screen sockets and logs stay <SERVICE_USER>-owned.
+
+set -uo pipefail
+
+CORE_IP=<CORE_HOST_IP>
+LOCK=/run/core-switch.lock
+# The SELECTED core, written before a switch begins. <OPEN5GS_STOP_SCRIPT> reads this
+# file and refuses (exit 5) while it says free5gc. Absent = open5gs by default.
+STATE=/run/core-switch.state
+LOG=/var/log/core-switch.log
+
+FREE5GC_DIR=<INSTALL_DIR>
+OPEN5GS_DIR=<OPEN5GS_DIR>
+OPEN5GS_STOP=<OPEN5GS_STOP_SCRIPT>
+OPEN5GS_START=<OPEN5GS_START_SCRIPT>
+OPEN5GS_USER=<SERVICE_USER>
+
+O5GS_NFS=(nrf scp udr udm ausf pcf bsf nssf amf smf upf)
+FREE5GC_MIN_NFS=9          # NfProfile documents expected in MongoDB. The NRF does not
+                           # register itself, so 10 started NFs produce 9 profiles.
+
+FREE_WAIT=20          # seconds to wait for the kernel to release a core's sockets
+# Health: EVERY check is re-evaluated together on this cadence until they all hold at once, or
+# the budget expires. A single pass is never enough -- free5GC binds its sockets ~1.1 s before
+# the SMF logs the PFCP association, which made a one-shot check report a false failure.
+HEALTH_TIMEOUT=60
+HEALTH_INTERVAL=2
+
+log() { printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$LOG" >&2; }
+die() { log "ERROR: $1"; exit "${2:-4}"; }
+
+# ===================================================================== socket probes
+# Return the PID holding a socket, or empty. SCTP needs -S; UDP needs -u.
+_pid_n2() { ss -H -l -n -p -S "sport = :38412"         2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1; }
+_pid_n3() { ss -H -l -n -p -u "src ${CORE_IP}:2152"    2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1; }
+_pid_n4() { ss -H -l -n -p -u "src ${CORE_IP}:8805"    2>/dev/null | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1; }
+
+_held_n2() { [ -n "$(ss -H -l -n -S "sport = :38412"      2>/dev/null)" ]; }
+_held_n3() { [ -n "$(ss -H -l -n -u "src ${CORE_IP}:2152" 2>/dev/null)" ]; }
+_held_n4() { [ -n "$(ss -H -l -n -u "src ${CORE_IP}:8805" 2>/dev/null)" ]; }
+
+sockets_free() { ! _held_n2 && ! _held_n3 && ! _held_n4; }
+
+# Map a PID to a core by its executable PATH. More robust than matching the `comm` string
+# in ss's process column, which is truncated to 15 chars and differs between the two stacks.
+_core_of_pid() {
+    local pid="$1" exe
+    [ -n "$pid" ] || { echo none; return; }
+    exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null)
+    case "$exe" in
+        "${OPEN5GS_DIR}"/*)      echo open5gs ;;
+        "${FREE5GC_DIR}"/bin/*)  echo free5gc ;;
+        "")                      echo unknown ;;   # socket held, process not readable
+        *)                       echo other   ;;
+    esac
+}
+
+# Human label for status output: core:comm:pid, or "-" when free.
+_owner_label() {
+    local pid="$1" comm
+    [ -n "$pid" ] || { echo "-"; return; }
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')
+    printf '%s:%s:%s\n' "$(_core_of_pid "$pid")" "${comm:-?}" "$pid"
+}
+
+which_core() {
+    local c2 c3 c4
+    c2=$(_core_of_pid "$(_pid_n2)")
+    c3=$(_core_of_pid "$(_pid_n3)")
+    c4=$(_core_of_pid "$(_pid_n4)")
+    if [ "$c2" = none ] && [ "$c3" = none ] && [ "$c4" = none ]; then echo none; return; fi
+    if [ "$c2" = "$c3" ] && [ "$c3" = "$c4" ]; then echo "$c2"; return; fi
+    # Partial state: fall back to N2 if it is a known core, else mixed.
+    case "$c2" in open5gs|free5gc) echo "$c2" ;; *) echo mixed ;; esac
+}
+
+# Sample which_core until it settles on a real core, or give up. Guards against reading
+# the socket table during someone else's restart, when no core momentarily owns anything.
+settle_core() {
+    local i c
+    for i in $(seq 1 "${1:-10}"); do
+        c=$(which_core)
+        case "$c" in open5gs|free5gc) echo "$c"; return 0 ;; esac
+        sleep 1
+    done
+    echo "${c:-none}"; return 1
+}
+
+wait_sockets_free() {
+    local i
+    for i in $(seq 1 "${1:-$FREE_WAIT}"); do sockets_free && return 0; sleep 1; done
+    return 1
+}
+
+# ===================================================================== helpers
+# NOTE: under iptables-nft, `-C` prints the matched rule to STDOUT on success, so these must
+# discard stdout as well as stderr or they corrupt the key=value status output.
+_nat_10_60() { iptables -t nat -C POSTROUTING -s 10.60.0.0/16 ! -o upfgtp -j MASQUERADE >/dev/null 2>&1; }
+_nat_10_45() { iptables -t nat -C POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE >/dev/null 2>&1; }
+_mss_ogstun() { iptables -t mangle -C FORWARD -o ogstun -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; }
+_mss_upfgtp() { iptables -t mangle -C FORWARD -o upfgtp -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; }
+
+_open5gs_procs() {
+    local nf out=""
+    for nf in "${O5GS_NFS[@]}"; do
+        pgrep -x "open5gs-${nf}d" >/dev/null 2>&1 && out="${out}${nf} "
+    done
+    echo "$out"
+}
+
+_free5gc_log() { ls -1dt "${FREE5GC_DIR}"/log/*/free5gc.log 2>/dev/null | head -1; }
+
+_free5gc_nf_count() {
+    mongosh --quiet free5gc --eval 'db.NfProfile.countDocuments({})' 2>/dev/null | tr -cd '0-9'
+}
+
+# Remove a stale upfgtp. A crashed free5GC UPF can leave the device behind still holding
+# 2152/udp in the kernel, which would make the Open5GS UPF fail to bind.
+_clear_stale_upfgtp() {
+    if ip link show upfgtp >/dev/null 2>&1; then
+        log "  removing leftover upfgtp"
+        ip link del upfgtp 2>/dev/null
+        sleep 1
+    fi
+}
+
+# ===================================================================== stop
+stop_free5gc() {
+    log "stopping free5GC"
+    systemctl stop free5gc.service free5gc-webconsole.service 2>&1 | sed 's/^/    /' >&2
+    _clear_stale_upfgtp
+    if ! wait_sockets_free "$FREE_WAIT"; then
+        log "free5GC sockets still held:"
+        ss -l -n -p -S "sport = :38412"      2>/dev/null | sed 's/^/    /' >&2
+        ss -l -n -p -u "src ${CORE_IP}:2152" 2>/dev/null | sed 's/^/    /' >&2
+        ss -l -n -p -u "src ${CORE_IP}:8805" 2>/dev/null | sed 's/^/    /' >&2
+        return 1
+    fi
+    rmmod gtp5g 2>/dev/null && log "  unloaded gtp5g"
+    log "free5GC stopped; N2/N3/N4 free"
+}
+
+stop_open5gs() {
+    log "stopping Open5GS via ${OPEN5GS_STOP}"
+    [ -x "$OPEN5GS_STOP" ] || { log "${OPEN5GS_STOP} missing or not executable"; return 1; }
+    # CORE_SWITCH_BYPASS lets OUR stop through the guard we ourselves armed a moment ago.
+    CORE_SWITCH_BYPASS=1 "$OPEN5GS_STOP" 2>&1 | sed 's/^/    /' >&2
+    local rc=${PIPESTATUS[0]}
+    if [ "$rc" -ne 0 ]; then log "${OPEN5GS_STOP} exited ${rc}"; return 1; fi
+    wait_sockets_free "$FREE_WAIT" || { log "sockets still held after stop_open5gs.sh"; return 1; }
+    log "Open5GS stopped; N2/N3/N4 free"
+}
+
+# ===================================================================== start
+start_free5gc() {
+    modprobe gtp5g || { log "gtp5g will not load - check 'dkms status' and 'uname -r'"; return 1; }
+    # StartLimitBurst=3 can latch the unit into "failed" after repeated attempts; clear it so a
+    # retry is never refused with "start request repeated too quickly".
+    systemctl reset-failed free5gc.service 2>/dev/null
+    log "starting free5GC (systemd)"
+    systemctl start free5gc.service || { log "free5gc.service failed to start"; return 1; }
+    health_free5gc || { log "free5GC started but failed its health check"; return 1; }
+    log "free5GC up and healthy"
+}
+
+start_open5gs() {
+    # A leftover upfgtp or an ownerless socket will stop the Open5GS UPF binding.
+    _clear_stale_upfgtp
+    if ! sockets_free; then
+        log "core sockets still held before starting Open5GS:"
+        ss -l -n -p -S "sport = :38412"      2>/dev/null | sed 's/^/    /' >&2
+        ss -l -n -p -u "src ${CORE_IP}:2152" 2>/dev/null | sed 's/^/    /' >&2
+        ss -l -n -p -u "src ${CORE_IP}:8805" 2>/dev/null | sed 's/^/    /' >&2
+        return 3
+    fi
+    log "starting Open5GS as ${OPEN5GS_USER} via ${OPEN5GS_START}"
+    # restart_open5gs.sh exits 0 whenever it reaches the end, so its status is logged but
+    # NEVER trusted; health_open5gs is the real gate.
+    sudo -n -u "$OPEN5GS_USER" -H "$OPEN5GS_START" 2>&1 | sed 's/^/    /' >&2
+    log "  restart_open5gs.sh exit=${PIPESTATUS[0]} (informational only)"
+    health_open5gs || die "Open5GS started but failed its health check" 4
+    log "Open5GS up and healthy"
+}
+
+# ===================================================================== health
+health_open5gs() {
+    local deadline why
+    deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+    while :; do
+        why=""
+        if   [ "$(_core_of_pid "$(_pid_n2)")" != open5gs ]; then why="N2 38412/sctp not owned by Open5GS"
+        elif [ "$(_core_of_pid "$(_pid_n3)")" != open5gs ]; then why="N3 ${CORE_IP}:2152/udp not owned by Open5GS"
+        elif [ "$(_core_of_pid "$(_pid_n4)")" != open5gs ]; then why="N4 ${CORE_IP}:8805/udp not owned by Open5GS"
+        elif ! ip link show ogstun >/dev/null 2>&1; then why="ogstun missing"
+        elif ! ip -br addr show ogstun 2>/dev/null | grep -q '10.45.0.1/16'; then why="ogstun has no 10.45.0.1/16"
+        elif ! _nat_10_45; then why="10.45.0.0/16 MASQUERADE rule missing"
+        # Open5GS SBI is HTTP/2 with prior knowledge (no h2c upgrade, no HTTP/1.1).
+        elif ! curl --http2-prior-knowledge -fsS --max-time 5 \
+                    http://127.0.0.10:7777/nnrf-nfm/v1/nf-instances >/dev/null 2>&1; then
+            why="NRF not answering on 127.0.0.10:7777"
+        fi
+        if [ -z "$why" ]; then
+            log "open5gs: HEALTHY (N2/N3/N4 owned, ogstun up, NAT present, NRF answering)"
+            return 0
+        fi
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep "$HEALTH_INTERVAL"
+    done
+    log "open5gs: UNHEALTHY after ${HEALTH_TIMEOUT}s - still failing: ${why}"
+    return 1
+}
+
+health_free5gc() {
+    local deadline why n lf stray
+    deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
+    while :; do
+        why=""; n=""; lf=""
+        if   [ "$(_core_of_pid "$(_pid_n2)")" != free5gc ]; then why="N2 38412/sctp not owned by free5GC"
+        elif [ "$(_core_of_pid "$(_pid_n3)")" != free5gc ]; then why="N3 ${CORE_IP}:2152/udp not owned by free5GC"
+        elif [ "$(_core_of_pid "$(_pid_n4)")" != free5gc ]; then why="N4 ${CORE_IP}:8805/udp not owned by free5GC"
+        else
+            # NF registration count from MongoDB. The NRF HTTP API is not used: it returns URI
+            # lists rather than a count, and nrfcfg.yaml has oauth: true.
+            n=$(_free5gc_nf_count)
+            lf=$(_free5gc_log)
+            if   [ -z "$n" ]; then why="could not read db.NfProfile count"
+            elif [ "$n" -lt "$FREE5GC_MIN_NFS" ]; then why="only ${n} NFs registered (need >= ${FREE5GC_MIN_NFS})"
+            elif [ -z "$lf" ]; then why="no log/*/free5gc.log found"
+            elif ! grep -q "Received PFCP Association Setup Accepted Response from UPF\[${CORE_IP}\]" "$lf" 2>/dev/null; then
+                why="no PFCP association from UPF[${CORE_IP}] in ${lf}"
+            elif ! ip link show upfgtp >/dev/null 2>&1; then why="upfgtp missing"
+            elif ! _nat_10_60; then why="10.60.0.0/16 MASQUERADE rule missing"
+            else
+                stray=$(_open5gs_procs)
+                [ -n "$stray" ] && why="Open5GS processes still present: ${stray}"
+            fi
+        fi
+        if [ -z "$why" ]; then
+            log "free5gc: HEALTHY (N2/N3/N4 owned, ${n} NFs registered, PFCP associated, upfgtp up, NAT present)"
+            return 0
+        fi
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep "$HEALTH_INTERVAL"
+    done
+    log "free5gc: UNHEALTHY after ${HEALTH_TIMEOUT}s - still failing: ${why}"
+    return 1
+}
+
+# ===================================================================== status
+# Three keys ETHOS reads to spot somebody else's hand on this host (its
+# GET /core -> activity). They are printed INSIDE the heredoc below, so
+# they carry no inline comments: cat would print those as output.
+#   core_started   when the process owning N2 started. A restart with no
+#                  last_switch to explain it was not ETHOS's doing.
+#   last_switch    the newest successful switch logged here. Both cores
+#                  write '<core> up and healthy', and only on success.
+#   foreign_procs  campaign-shaped processes as <basename>:<pid>. The
+#                  basename, not python3: the interpreter names nothing.
+do_status() {
+    local p2 p3 p4 ngap
+    p2=$(_pid_n2); p3=$(_pid_n3); p4=$(_pid_n4)
+    ngap=$(ss -H -n -S state established "sport = :38412" 2>/dev/null \
+           | awk '{print $4}' | grep -v '^$' | sort -u | paste -sd, -)
+    cat <<OUT
+core=$(which_core)
+selected=$(cat "$STATE" 2>/dev/null || echo "open5gs(default)")
+n2_38412_sctp=$(_owner_label "$p2")
+n3_2152_udp=$(_owner_label "$p3")
+n4_8805_udp=$(_owner_label "$p4")
+ngap_peers_established=${ngap:--}
+ogstun=$(ip -br addr show ogstun 2>/dev/null | awk '{print $2","$3}' || echo absent)
+upfgtp=$(ip -br addr show upfgtp 2>/dev/null | awk '{print $2}' || echo absent)
+gtp5g_loaded=$(lsmod | awk '$1=="gtp5g"{print "yes"}' | head -1)
+gtp5g_version=$(modinfo gtp5g 2>/dev/null | awk '/^version:/{print $2}')
+gtp5g_dkms=$(dkms status gtp5g 2>/dev/null | paste -sd';' -)
+kernel=$(uname -r)
+nat_10_45_open5gs=$(_nat_10_45 && echo present || echo absent)
+nat_10_60_free5gc=$(_nat_10_60 && echo present || echo absent)
+mangle_mss_ogstun=$(_mss_ogstun && echo present || echo absent)
+mangle_mss_upfgtp=$(_mss_upfgtp && echo present || echo absent)
+route_gnb=$(ip route get <GNB_PROBE_IP> 2>/dev/null | head -1 | sed 's/  */ /g')
+open5gs_version=$(git -C "$OPEN5GS_DIR" describe --tags 2>/dev/null)
+free5gc_version=$(git -C "$FREE5GC_DIR" describe --tags 2>/dev/null)
+free5gc_units=$(systemctl is-active free5gc.service 2>/dev/null)/$(systemctl is-active free5gc-webconsole.service 2>/dev/null)
+open5gs_procs=$(_open5gs_procs | sed 's/ $//')
+data_iface_ring=$(ethtool -g <DATA_IFACE> 2>/dev/null | awk '/Current hardware settings/{f=1} f&&/^RX:/{rx=$2} f&&/^TX:/{tx=$2} END{print "rx="rx",tx="tx}')
+irqbalance=$(systemctl is-active irqbalance 2>/dev/null)
+core_started=$([ -n "$p2" ] && date -Is -d "$(ps -o lstart= -p "$p2" 2>/dev/null)" 2>/dev/null)
+last_switch=$(grep -F 'up and healthy' "$LOG" 2>/dev/null | tail -1 | awk '{print $1}')
+foreign_procs=$(pgrep -af '[e]2e_recorded\.py|[e]2e_core\.py|[n]r-softmodem|[r]estart_open5gs\.sh' 2>/dev/null \
+    | awk '{pid=$1; name=""; for (i=2; i<=NF; i++) { if ($i ~ /e2e_recorded\.py$|e2e_core\.py$|nr-softmodem$|restart_open5gs\.sh$/) { n=split($i, a, "/"); name=a[n]; break } } if (name != "") print name ":" pid }' \
+    | paste -sd' ' -)
+timestamp=$(date -Is)
+OUT
+}
+
+# ===================================================================== main
+case "${1:-}" in
+    status)
+        do_status; exit 0 ;;
+    health)
+        do_status
+        HC=$(settle_core 10)
+        case "$HC" in
+            open5gs) health_open5gs; exit $? ;;
+            free5gc) health_free5gc; exit $? ;;
+            none)    log "no core is running"; exit 4 ;;
+            *)       log "core state is '${HC}' - neither core owns all three sockets"; exit 4 ;;
+        esac ;;
+    open5gs|free5gc) : ;;
+    *)
+        echo "usage: core-switch {open5gs|free5gc|status|health}" >&2
+        exit 1 ;;
+esac
+
+[ "$(id -u)" -eq 0 ] || { echo "core-switch: must run as root (use sudo)" >&2; exit 1; }
+
+mkdir -p "$(dirname "$LOG")"; touch "$LOG"
+exec 9>"$LOCK"
+flock -n 9 || { echo "core-switch: another instance is running (lock: $LOCK)" >&2; exit 2; }
+
+TARGET="$1"
+CURRENT="$(which_core)"
+log "=== switch -> ${TARGET} (current: ${CURRENT}) ==="
+
+# Record the INTENDED core BEFORE stopping anything. <OPEN5GS_STOP_SCRIPT> reads this file
+# and refuses with exit 5 while free5gc is selected, so a scheduled restarter cannot interleave
+# with a switch in flight. Our own stop carries CORE_SWITCH_BYPASS=1 past that guard.
+printf '%s\n' "$TARGET" > "$STATE"
+log "selected core recorded: ${TARGET} -> ${STATE}"
+
+# A failed switch to free5GC deliberately LEAVES the state at free5gc, so the guard stays armed
+# while the operator investigates. Recovery is one explicit command.
+fail_free5gc() {
+    log "ERROR: $1"
+    log "switch failed; Open5GS is stopped; recover with: sudo core-switch open5gs"
+    do_status
+    exit 4
+}
+
+case "$TARGET" in
+    open5gs)
+        if [ "$CURRENT" = open5gs ]; then
+            log "already on open5gs; verifying"
+            health_open5gs || exit 4
+        else
+            stop_free5gc || die "could not free the sockets from free5GC" 3
+            start_open5gs || exit $?
+        fi ;;
+    free5gc)
+        if [ "$CURRENT" = free5gc ]; then
+            log "already on free5gc; verifying"
+            health_free5gc || exit 4
+        else
+            stop_open5gs || fail_free5gc "could not free the sockets from Open5GS"
+            start_free5gc || fail_free5gc "free5GC did not come up healthy"
+        fi ;;
+esac
+
+do_status
+exit 0
