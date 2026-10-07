@@ -302,6 +302,16 @@ uuidgen            # e.g. 3f2b1c84-9d7e-4a15-b0c3-6e8f24a7d591
 
 The N3 endpoint defaults to a loopback address such as `127.0.0.8`, which no gNB can reach.
 
+```yaml
+  urrThreshold: 107374182400
+```
+
+Upstream asks the UPF for a usage report every `500000` bytes, which at a few hundred Mbit/s is
+over a hundred reports a second, and the SMF clears each one by waiting for the CHF to write a
+CDR: the reports queue faster than they drain, and the next PDU session for that subscriber waits
+behind the queue rather than being set up. Raise the threshold on any host that carries a
+throughput test; leave `urrPeriod` alone, so a periodic report still arrives every 30 s.
+
 ### upfcfg.yaml
 
 ```yaml
@@ -626,6 +636,7 @@ sudo core-switch health
 | Open5GS NRF fails to start or answers nothing after a switch back | its SBI needs HTTP/2; a proxy or a downgraded client turns it into HTTP/1.1 | query it directly with `curl --http2-prior-knowledge`, and keep proxies off loopback |
 | A glob in a shell script silently matches nothing and the script aborts | zsh's `nomatch` aborts on an unmatched glob where bash passes it through | run deployment commands under `bash`, not the login shell |
 | UE registers, then `RequestedNssai[{Sst:1 Sd:}] is not supported by AMF` | the subscriber or `amfcfg.yaml` still carries an SD | remove the SD from the subscriber's slice and from `plmnSupportList`; both must be `sst: 1` alone |
+| Repeats after the first get no PDU session; the UE registers but has no address; the AMF logs `CreateSmContextRequest ... context deadline exceeded` | a charging-report backlog in the SMF from the 500 kB `urrThreshold` | set `urrThreshold: 107374182400` in `smfcfg.yaml` |
 | `No TA {...tac:000001} in NSSF configuration` | the TAC is unquoted and parsed as the integer `1` | quote `mcc`, `mnc` and `tac` in every file |
 | `No AMF <uuid> in NSSF configuration` | the AMF's instance ID is generated fresh at each start | pin `nfInstanceId` in `amfcfg.yaml` and list the same UUID in the NSSF `amfList` |
 | WebConsole answers the API but the browser shows `404 page not found` | `public/` is missing, or the working directory is wrong | build or copy `webconsole/public`, and keep `WorkingDirectory=<INSTALL_DIR>/webconsole` |

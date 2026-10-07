@@ -114,7 +114,7 @@ configuration:
   nrfUri: http://127.0.0.10:8000 # a valid URI of NRF
   nrfCertPem: cert/nrf.pem # NRF Certificate
   urrPeriod: 30 # default usage report period in seconds
-  urrThreshold: 500000 # default usage report threshold in bytes
+  urrThreshold: 107374182400 # 100 GB: no volume-triggered usage report during a sweep
   requestedUnit: 1000
 
 # Logging Configuration
