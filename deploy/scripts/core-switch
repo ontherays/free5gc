@@ -63,6 +63,13 @@ _held_n4() { [ -n "$(ss -H -l -n -u "src ${CORE_IP}:8805" 2>/dev/null)" ]; }
 
 sockets_free() { ! _held_n2 && ! _held_n3 && ! _held_n4; }
 
+# Print the three socket owners, for a log line that names who is holding what.
+_show_socket_owners() {
+    ss -l -n -p -S "sport = :38412"      2>/dev/null | sed 's/^/    /' >&2
+    ss -l -n -p -u "src ${CORE_IP}:2152" 2>/dev/null | sed 's/^/    /' >&2
+    ss -l -n -p -u "src ${CORE_IP}:8805" 2>/dev/null | sed 's/^/    /' >&2
+}
+
 # Map a PID to a core by its executable PATH. More robust than matching the `comm` string
 # in ss's process column, which is truncated to 15 chars and differs between the two stacks.
 _core_of_pid() {
@@ -114,6 +121,31 @@ wait_sockets_free() {
     return 1
 }
 
+# Does a process of this core hold ANY of N2, N3 or N4? A socket belongs to a
+# core only when a process of that core holds it. "the other core must be
+# holding it" is not an answer the socket table supports: a part-crashed
+# Open5GS keeps 2152/udp and 8805/udp, and reading those as free5GC's made a
+# switch stop free5GC (which was not running) and then fail.
+holds_a_socket() {
+    local want="$1" pid
+    for pid in "$(_pid_n2)" "$(_pid_n3)" "$(_pid_n4)"; do
+        [ -n "$pid" ] || continue
+        [ "$(_core_of_pid "$pid")" = "$want" ] && return 0
+    done
+    return 1
+}
+
+# Wait until this core holds none of the three. NOT the same as all three
+# being free: the other core, or something unreadable, may still hold one.
+wait_core_released() {
+    local want="$1" i
+    for i in $(seq 1 "${2:-$FREE_WAIT}"); do
+        holds_a_socket "$want" || return 0
+        sleep 1
+    done
+    return 1
+}
+
 # ===================================================================== helpers
 # NOTE: under iptables-nft, `-C` prints the matched rule to STDOUT on success, so these must
 # discard stdout as well as stderr or they corrupt the key=value status output.
@@ -128,6 +160,15 @@ _open5gs_procs() {
         pgrep -x "open5gs-${nf}d" >/dev/null 2>&1 && out="${out}${nf} "
     done
     echo "$out"
+}
+
+# The expected daemons that are NOT running, by name. Empty when all are up.
+_open5gs_missing() {
+    local nf out=""
+    for nf in "${O5GS_NFS[@]}"; do
+        pgrep -x "open5gs-${nf}d" >/dev/null 2>&1 || out="${out}${nf} "
+    done
+    echo "${out% }"
 }
 
 _free5gc_log() { ls -1dt "${FREE5GC_DIR}"/log/*/free5gc.log 2>/dev/null | head -1; }
@@ -151,15 +192,13 @@ stop_free5gc() {
     log "stopping free5GC"
     systemctl stop free5gc.service free5gc-webconsole.service 2>&1 | sed 's/^/    /' >&2
     _clear_stale_upfgtp
-    if ! wait_sockets_free "$FREE_WAIT"; then
-        log "free5GC sockets still held:"
-        ss -l -n -p -S "sport = :38412"      2>/dev/null | sed 's/^/    /' >&2
-        ss -l -n -p -u "src ${CORE_IP}:2152" 2>/dev/null | sed 's/^/    /' >&2
-        ss -l -n -p -u "src ${CORE_IP}:8805" 2>/dev/null | sed 's/^/    /' >&2
+    if ! wait_core_released free5gc "$FREE_WAIT"; then
+        log "a free5GC process still holds a core socket:"
+        _show_socket_owners
         return 1
     fi
     rmmod gtp5g 2>/dev/null && log "  unloaded gtp5g"
-    log "free5GC stopped; N2/N3/N4 free"
+    log "free5GC stopped; it holds no core socket"
 }
 
 stop_open5gs() {
@@ -169,12 +208,21 @@ stop_open5gs() {
     CORE_SWITCH_BYPASS=1 "$OPEN5GS_STOP" 2>&1 | sed 's/^/    /' >&2
     local rc=${PIPESTATUS[0]}
     if [ "$rc" -ne 0 ]; then log "${OPEN5GS_STOP} exited ${rc}"; return 1; fi
-    wait_sockets_free "$FREE_WAIT" || { log "sockets still held after stop_open5gs.sh"; return 1; }
-    log "Open5GS stopped; N2/N3/N4 free"
+    if ! wait_core_released open5gs "$FREE_WAIT"; then
+        log "an Open5GS process still holds a core socket:"
+        _show_socket_owners
+        return 1
+    fi
+    log "Open5GS stopped; it holds no core socket"
 }
 
 # ===================================================================== start
 start_free5gc() {
+    if ! sockets_free; then
+        log "core sockets still held before starting free5GC:"
+        _show_socket_owners
+        return 3
+    fi
     modprobe gtp5g || { log "gtp5g will not load - check 'dkms status' and 'uname -r'"; return 1; }
     # StartLimitBurst=3 can latch the unit into "failed" after repeated attempts; clear it so a
     # retry is never refused with "start request repeated too quickly".
@@ -190,9 +238,7 @@ start_open5gs() {
     _clear_stale_upfgtp
     if ! sockets_free; then
         log "core sockets still held before starting Open5GS:"
-        ss -l -n -p -S "sport = :38412"      2>/dev/null | sed 's/^/    /' >&2
-        ss -l -n -p -u "src ${CORE_IP}:2152" 2>/dev/null | sed 's/^/    /' >&2
-        ss -l -n -p -u "src ${CORE_IP}:8805" 2>/dev/null | sed 's/^/    /' >&2
+        _show_socket_owners
         return 3
     fi
     log "starting Open5GS as ${OPEN5GS_USER} via ${OPEN5GS_START}"
@@ -206,11 +252,12 @@ start_open5gs() {
 
 # ===================================================================== health
 health_open5gs() {
-    local deadline why
+    local deadline why missing
     deadline=$(( $(date +%s) + HEALTH_TIMEOUT ))
     while :; do
-        why=""
-        if   [ "$(_core_of_pid "$(_pid_n2)")" != open5gs ]; then why="N2 38412/sctp not owned by Open5GS"
+        why=""; missing=""
+        if   ! _held_n2; then why="nothing is listening on N2 SCTP 38412"
+        elif [ "$(_core_of_pid "$(_pid_n2)")" != open5gs ]; then why="N2 38412/sctp not owned by Open5GS"
         elif [ "$(_core_of_pid "$(_pid_n3)")" != open5gs ]; then why="N3 ${CORE_IP}:2152/udp not owned by Open5GS"
         elif [ "$(_core_of_pid "$(_pid_n4)")" != open5gs ]; then why="N4 ${CORE_IP}:8805/udp not owned by Open5GS"
         elif ! ip link show ogstun >/dev/null 2>&1; then why="ogstun missing"
@@ -220,9 +267,15 @@ health_open5gs() {
         elif ! curl --http2-prior-knowledge -fsS --max-time 5 \
                     http://127.0.0.10:7777/nnrf-nfm/v1/nf-instances >/dev/null 2>&1; then
             why="NRF not answering on 127.0.0.10:7777"
+        else
+            # Owning the three sockets proves the AMF, SMF and UPF are up. It
+            # says nothing about the other eight, and a core missing one of
+            # those is not a core a run may be attributed to.
+            missing=$(_open5gs_missing)
+            [ -n "$missing" ] && why="these Open5GS daemons are not running: ${missing}"
         fi
         if [ -z "$why" ]; then
-            log "open5gs: HEALTHY (N2/N3/N4 owned, ogstun up, NAT present, NRF answering)"
+            log "open5gs: HEALTHY (all ${#O5GS_NFS[@]} daemons up, N2 SCTP 38412 listening, N3/N4 owned, ogstun up, NAT present, NRF answering)"
             return 0
         fi
         [ "$(date +%s)" -ge "$deadline" ] && break
@@ -366,7 +419,19 @@ case "$TARGET" in
             log "already on open5gs; verifying"
             health_open5gs || exit 4
         else
-            stop_free5gc || die "could not free the sockets from free5GC" 3
+            # Stop the core that actually holds a socket, and only that one.
+            # A part-crashed Open5GS (its AMF gone, its UPF still on 2152/udp
+            # and 8805/udp) reads as "mixed", and stopping free5GC cannot
+            # release a socket an Open5GS process holds.
+            if holds_a_socket free5gc; then
+                stop_free5gc || die "could not free the sockets from free5GC" 3
+            else
+                log "no free5GC process holds a core socket; nothing to stop there"
+            fi
+            if holds_a_socket open5gs; then
+                log "Open5GS is part-running; stopping it before the restart"
+                stop_open5gs || die "could not free the sockets from Open5GS" 3
+            fi
             start_open5gs || exit $?
         fi ;;
     free5gc)
@@ -374,7 +439,15 @@ case "$TARGET" in
             log "already on free5gc; verifying"
             health_free5gc || exit 4
         else
-            stop_open5gs || fail_free5gc "could not free the sockets from Open5GS"
+            if holds_a_socket open5gs; then
+                stop_open5gs || fail_free5gc "could not free the sockets from Open5GS"
+            else
+                log "no Open5GS process holds a core socket; nothing to stop there"
+            fi
+            if holds_a_socket free5gc; then
+                log "free5GC is part-running; stopping it before the restart"
+                stop_free5gc || fail_free5gc "could not free the sockets from free5GC"
+            fi
             start_free5gc || fail_free5gc "free5GC did not come up healthy"
         fi ;;
 esac

@@ -476,7 +476,11 @@ a caller cannot set it, because `sudo`'s `env_reset` strips it.
 sudo cp deploy/scripts/core-switch /usr/local/bin/core-switch
 sudo chown root:root /usr/local/bin/core-switch
 sudo chmod 755 /usr/local/bin/core-switch
-sudo sed -i 's|<INSTALL_DIR>|/actual/path|g; s|<CORE_HOST_IP>|10.0.0.5|g' /usr/local/bin/core-switch
+sudo sed -i 's|<INSTALL_DIR>|/actual/path|g; s|<CORE_HOST_IP>|10.0.0.5|g;
+             s|<OPEN5GS_DIR>|/home/core/open5gs|g; s|<OPEN5GS_STOP_SCRIPT>|/home/core/stop_open5gs.sh|g;
+             s|<OPEN5GS_START_SCRIPT>|/home/core/restart_open5gs.sh|g; s|<SERVICE_USER>|core|g;
+             s|<GNB_PROBE_IP>|10.1.2.50|g; s|<DATA_IFACE>|eno1|g' /usr/local/bin/core-switch
+sudo grep -n '<[A-Z_]*>' /usr/local/bin/core-switch      # no output: every placeholder is gone
 sudo bash -n /usr/local/bin/core-switch
 ```
 
